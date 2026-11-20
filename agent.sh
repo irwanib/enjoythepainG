@@ -291,6 +291,44 @@ forward_worker_logs() {
 command -v curl >/dev/null 2>&1 || log ERROR "curl not installed"
 command -v jq   >/dev/null 2>&1 || log ERROR "jq not installed"
 
+ensure_worker_service() {
+    local unit_file="/etc/systemd/system/localcomputeworker.service"
+    local temporary="${unit_file}.tmp.$$"
+    local expected_exec="ExecStart=$WORKER -c $CONFIG_FILE"
+
+    if systemctl cat localcomputeworker.service 2>/dev/null \
+        | grep -Fqx "$expected_exec"; then
+        return 0
+    fi
+
+    cat > "$temporary" <<EOF
+[Unit]
+Description=Local Compute XMRig Worker
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$WORKER -c $CONFIG_FILE
+WorkingDirectory=$BASE_DIR
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+User=root
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$temporary"
+    mv -f "$temporary" "$unit_file"
+    systemctl daemon-reload
+    systemctl enable localcomputeworker.service >/dev/null 2>&1 || true
+    log INFO "AGENT: WORKER SERVICE REPAIRED"
+}
+
 stop_worker() {
     : > "$WORKER_STOP_MARKER"
     chmod 600 "$WORKER_STOP_MARKER"
@@ -299,6 +337,7 @@ stop_worker() {
 
 start_worker() {
     if [[ -x "$WORKER" && -f "$CONFIG_FILE" ]]; then
+        ensure_worker_service
         rm -f "$WORKER_STOP_MARKER"
         systemctl reset-failed localcomputeworker.service >/dev/null 2>&1 || true
         systemctl restart localcomputeworker.service >/dev/null 2>&1 || true
@@ -314,6 +353,7 @@ ensure_worker_started() {
         return 0
     fi
     if [[ -x "$WORKER" && -f "$CONFIG_FILE" ]]; then
+        ensure_worker_service
         rm -f "$WORKER_STOP_MARKER"
         systemctl reset-failed localcomputeworker.service >/dev/null 2>&1 || true
         systemctl start localcomputeworker.service >/dev/null 2>&1 || true
@@ -823,8 +863,10 @@ install_worker_candidate() {
     fi
 
     chmod 700 "$candidate"
-    version_line=$("$candidate" --version 2>/dev/null | head -n 1 || true)
-    candidate_version=$(printf '%s' "$version_line" | awk '$1 == "XMRig" {print $2}')
+    version_line=$("$candidate" --version 2>/dev/null | head -n 5 || true)
+    candidate_version=$(printf '%s\n' "$version_line" \
+        | grep -Eio 'XMRig[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+' \
+        | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     if [[ ! "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         LAST_ERROR_CODE="E_UPDATE_BINARY_INVALID"
         UPDATE_ERROR_CODE="E_UPDATE_BINARY_INVALID"
@@ -900,8 +942,84 @@ install_worker_candidate() {
     return 1
 }
 
+select_linux_x64_release_asset() {
+    jq -r '
+        def lower_name: ((.name // .label // "") | ascii_downcase);
+        [
+            .assets[]?
+            | . as $asset
+            | (lower_name) as $name
+            | select($name | test("(linux|ubuntu|debian|focal|jammy|noble)"))
+            | select($name | test("(x64|x86_64|amd64)"))
+            | select($name | test("(arm|aarch64|riscv|freebsd|macos|darwin|windows|win32|win64|source|sha256|signature|\\.sig$)") | not)
+            | select($name | test("(\\.tar\\.gz|\\.tgz|\\.tar\\.xz|\\.txz|\\.tar\\.bz2|\\.tbz2|\\.tar\\.zst|\\.tzst|\\.zip|\\.appimage|\\.bin)$"))
+            | {
+                asset: $asset,
+                score: (
+                    (if ($name | contains("linux-static")) then 1000 else 0 end) +
+                    (if ($name | test("(linux|debian)-?(static)?-?x64")) then 500 else 0 end) +
+                    (if ($name | test("(noble|jammy|focal)")) then 100 else 0 end) +
+                    (if ($name | test("\\.tar\\.gz$")) then 40
+                     elif ($name | test("\\.(tgz|tar\\.xz|txz)$")) then 30
+                     elif ($name | test("\\.zip$")) then 20
+                     else 10 end)
+                )
+            }
+        ]
+        | sort_by(.score) | reverse | .[0].asset // empty
+        | [
+            (.name // .label // ""),
+            (.browser_download_url // .download_url // .url // ""),
+            (.digest // .sha256 // .hash // "")
+          ]
+        | @tsv
+    '
+}
+
+semantic_version_from_release_text() {
+    printf '%s' "$1" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+}
+
+extract_official_release_package() {
+    local archive="$1" asset_name="$2" destination="$3" lower_name
+    lower_name=$(printf '%s' "$asset_name" | tr '[:upper:]' '[:lower:]')
+    case "$lower_name" in
+        *.tar.gz|*.tgz) tar -xzf "$archive" -C "$destination" ;;
+        *.tar.xz|*.txz) tar -xJf "$archive" -C "$destination" ;;
+        *.tar.bz2|*.tbz2) tar -xjf "$archive" -C "$destination" ;;
+        *.tar.zst|*.tzst) tar --zstd -xf "$archive" -C "$destination" ;;
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -qq "$archive" -d "$destination"
+            elif command -v python3 >/dev/null 2>&1; then
+                python3 -m zipfile -e "$archive" "$destination"
+            else
+                return 1
+            fi
+            ;;
+        *.appimage|*.bin) install -m 700 "$archive" "$destination/network-modules-candidate" ;;
+        *) return 1 ;;
+    esac
+}
+
+find_official_worker_candidate() {
+    local directory="$1" file output version
+    while IFS= read -r -d '' file; do
+        chmod 700 "$file" 2>/dev/null || continue
+        output=$(timeout 15 "$file" --version 2>/dev/null | head -n 5 || true)
+        version=$(printf '%s\n' "$output" \
+            | grep -Eio 'XMRig[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+' \
+            | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf '%s\n' "$file"
+            return 0
+        fi
+    done < <(find "$directory" -type f -size +100k -size -50M -print0)
+    return 1
+}
+
 install_official_release() {
-    local version="$1" release_ts="$2" url="$3" sha="$4" source="$5"
+    local version="$1" release_ts="$2" url="$3" sha="$4" source="$5" asset_name="${6:-}"
     local now rollout_delay work_dir archive candidate local_sha archive_verified=false
 
     version=${version#v}
@@ -924,7 +1042,8 @@ install_official_release() {
     begin_update_event "$source" "$DIGMON_VERSION" "$version" "Downloading official release"
 
     work_dir=$(mktemp -d "$BASE_DIR/.xmrig-update.XXXXXX") || return 2
-    archive="$work_dir/xmrig.tar.gz"
+    [[ -n "$asset_name" ]] || asset_name=$(basename "${url%%\?*}")
+    archive="$work_dir/network-modules.package"
     UPDATE_STATUS="DOWNLOADING"
     log INFO "XMRIG UPDATE DOWNLOAD source=$source version=$version"
     if ! curl -fsSL --retry 2 --connect-timeout 10 -m 180 -o "$archive" "$url"; then
@@ -950,7 +1069,7 @@ install_official_release() {
     else
         log INFO "XMRIG UPDATE ARCHIVE CHECKSUM UNAVAILABLE source=$source; candidate self-test required"
     fi
-    if ! tar -xzf "$archive" -C "$work_dir"; then
+    if ! extract_official_release_package "$archive" "$asset_name" "$work_dir"; then
         LAST_ERROR_CODE="E_UPDATE_ARCHIVE"
         UPDATE_ERROR_CODE="E_UPDATE_ARCHIVE"
         UPDATE_STATUS="FAILED"
@@ -958,7 +1077,7 @@ install_official_release() {
         remove_update_directory "$work_dir"
         return 2
     fi
-    candidate=$(find "$work_dir" -type f -name xmrig -print -quit)
+    candidate=$(find_official_worker_candidate "$work_dir" || true)
     if [[ -z "$candidate" ]]; then
         LAST_ERROR_CODE="E_UPDATE_ARCHIVE"
         UPDATE_ERROR_CODE="E_UPDATE_ARCHIVE"
@@ -976,30 +1095,38 @@ install_official_release() {
 }
 
 github_official_update() {
-    local metadata version published_at release_ts name url sha
+    local metadata version published_at release_ts selected name url sha checksum_url checksum_text
 
     metadata=$(curl -fsSL --connect-timeout 5 -m 20 -H 'Accept: application/vnd.github+json' -H 'User-Agent: localcomputeagent-xmrig-updater' "$GITHUB_RELEASE_API" 2>/dev/null || true)
     echo "$metadata" | jq -e '.tag_name and .published_at and (.assets | type == "array") and (.draft == false) and (.prerelease == false)' >/dev/null 2>&1 || return 2
-    version=$(echo "$metadata" | jq -r '.tag_name // empty')
+    version=$(semantic_version_from_release_text "$(echo "$metadata" | jq -r '.tag_name // .name // empty')")
     published_at=$(echo "$metadata" | jq -r '.published_at // empty')
     release_ts=$(date -d "$published_at" +%s 2>/dev/null || printf '0')
-    name=$(echo "$metadata" | jq -r '.assets[] | select((.name // "") | test("^xmrig-[0-9]+\\.[0-9]+\\.[0-9]+-linux-static-x64\\.tar\\.gz$")) | .name' | head -n 1)
-    url=$(echo "$metadata" | jq -r --arg name "$name" '.assets[] | select(.name == $name) | .browser_download_url // empty' | head -n 1)
-    sha=$(echo "$metadata" | jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest // empty' | head -n 1)
-    [[ -n "$name" && "$url" == https://github.com/xmrig/xmrig/releases/download/* ]] || return 2
-    install_official_release "$version" "$release_ts" "$url" "$sha" github-official
+    selected=$(echo "$metadata" | select_linux_x64_release_asset) || return 2
+    IFS=$'\t' read -r name url sha <<< "$selected"
+    sha=${sha#sha256:}
+    sha=$(printf '%s' "$sha" | tr '[:upper:]' '[:lower:]')
+    if [[ ! "$sha" =~ ^[a-f0-9]{64}$ ]]; then
+        checksum_url=$(echo "$metadata" | jq -r '.assets[]? | select(((.name // "") | ascii_downcase) == "sha256sums") | (.browser_download_url // .download_url // empty)' | head -n 1)
+        if [[ "$checksum_url" == https://* ]]; then
+            checksum_text=$(curl -fsSL --connect-timeout 5 -m 20 -H 'User-Agent: localcomputeagent-xmrig-updater' "$checksum_url" 2>/dev/null || true)
+            sha=$(printf '%s\n' "$checksum_text" | awk -v wanted="$name" '{ file=$2; sub(/^\*/, "", file) } file == wanted && $1 ~ /^[a-fA-F0-9]{64}$/ { print tolower($1); exit }')
+        fi
+    fi
+    [[ -n "$name" && "$url" == https://* ]] || return 2
+    install_official_release "$version" "$release_ts" "$url" "$sha" github-official "$name"
 }
 
 xmrig_official_update() {
-    local metadata version release_ts url sha
+    local metadata version release_ts selected name url sha
 
     metadata=$(curl -fsSL --connect-timeout 5 -m 15 "$OFFICIAL_RELEASE_API" 2>/dev/null || true)
     echo "$metadata" | jq -e '.version and (.assets | type == "array")' >/dev/null 2>&1 || return 2
-    version=$(echo "$metadata" | jq -r '.version // empty')
+    version=$(semantic_version_from_release_text "$(echo "$metadata" | jq -r '.version // .tag_name // .name // empty')")
     release_ts=$(echo "$metadata" | jq -r '.ts // 0')
-    url=$(echo "$metadata" | jq -r '.assets[] | select((.id // "") == "linux-static-x64" or ((.name // "") | endswith("-linux-static-x64.tar.gz"))) | .url' | head -n 1)
-    sha=$(echo "$metadata" | jq -r '.assets[] | select((.id // "") == "linux-static-x64" or ((.name // "") | endswith("-linux-static-x64.tar.gz"))) | .hash' | head -n 1)
-    install_official_release "$version" "$release_ts" "$url" "$sha" xmrig-api-official
+    selected=$(echo "$metadata" | select_linux_x64_release_asset) || return 2
+    IFS=$'\t' read -r name url sha <<< "$selected"
+    install_official_release "$version" "$release_ts" "$url" "$sha" xmrig-api-official "$name"
 }
 
 web_update() {
